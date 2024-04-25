@@ -8,10 +8,8 @@ readme = "README.md"
 [tool.poetry.dependencies]
 python = "^3.11"
 numpy = "^1.26.4"
-pycuda = "^2024.1"
 cupy-cuda12x = "^13.1.0"
 opencv-python = "^4.9.0.80"
-line-profiler = "^4.1.2"
 numba = "^0.59.1"
 
 
