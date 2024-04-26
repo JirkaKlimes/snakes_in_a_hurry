@@ -390,7 +390,7 @@ class CUDASnake:
             self.game_state_device.is_dead,
             moves,
             np.uint32(game.num),
-            np.uint8(game.size),
+            np.uint32(game.size),
             self.rng_states_device,
         )
 
@@ -413,7 +413,7 @@ class CUDASnake:
             self.game_state_device.food_position,
             self.game_state_device.is_dead,
             np.uint32(num),
-            np.uint8(self.size),
+            np.uint32(self.size),
         )
         image = self.image_device.copy_to_host()
         return image
