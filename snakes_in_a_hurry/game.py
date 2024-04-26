@@ -52,14 +52,14 @@ class CUDASnakeGame:
             head_positions=np.empty((self.num, 2, 2), dtype=np.uint8),
             food_position=np.empty((self.num, 2), dtype=np.uint8),
             body_directions=np.empty(
-                (self.num, 2, self.size * self.size), dtype=np.uint8
+                (self.num, 2, (self.size * self.size) // 8), dtype=np.uint16
             ),
             body_direction_start_offset=np.empty((self.num, 2), dtype=np.uint16),
             body_lengths=np.empty((self.num, 2), dtype=np.uint16),
             bitmasks=np.empty(
                 (self.num, self.size // 4, self.size // 4, 2), dtype=np.uint16
             ),
-            is_dead=np.empty((self.num, 2), dtype=bool),
+            is_dead=np.empty((self.num, 2), dtype=np.uint8),
             tail_positions=np.empty((self.num, 2, 2), dtype=np.uint8),
         )
         self.image_device: DeviceNDArray = None
@@ -82,7 +82,16 @@ class CUDASnakeGame:
             ]
         )
 
-        self.game_state_host.body_directions[:, :, :2] = np.array([[0, 3], [1, 2]])
+        body_directions = np.zeros((2, self.size * self.size), dtype=np.uint16)
+        body_directions[:, :2] = np.array([[0, 3], [1, 2]])
+        shifts = np.tile(
+            np.arange(0, 16, 2, dtype=np.uint16), (self.size * self.size) // 8
+        )
+        body_directions <<= shifts
+        body_directions = np.reshape(
+            body_directions, (2, (self.size * self.size) // 8, 8)
+        ).sum(axis=-1)
+        self.game_state_host.body_directions[:] = body_directions
         self.game_state_host.body_lengths[...] = 2
         self.game_state_host.body_direction_start_offset[...] = 0
         self.game_state_host.food_position[:] = np.random.randint(
@@ -174,9 +183,8 @@ class CUDASnakeGame:
             is_dead = many_dead[game_idx]
             moves = many_moves[game_idx]
 
-            last_directions = body_direction[
-                player, body_direction_start_offset[player]
-            ]
+            s = body_direction_start_offset[player]
+            last_directions = body_direction[player, s // 8] >> (2 * (s % 8)) & 0b11
             invalid_move = last_directions == moves[player]
             __shared_new_head_positions = cuda.shared.array(
                 (32, 2, 2), dtype=numba.uint8
@@ -227,11 +235,10 @@ class CUDASnakeGame:
             elif not is_dead[player]:
                 x, y = tail_positions[player]
                 bitmasks[y // 4, x // 4, player] &= ~(1 << (x % 4 + y % 4 * 4))
-                tail_dir = body_direction[
-                    player,
-                    (body_direction_start_offset[player] + body_lengths[player] - 1)
-                    % body_direction[player].shape[0],
-                ]
+                s = (
+                    body_direction_start_offset[player] + body_lengths[player] - 1
+                ) % body_direction[player].shape[0]
+                tail_dir = body_direction[player, s // 8] >> (2 * (s % 8)) & 0b11
                 tail_dir = INVERSE_MOVES[tail_dir]
                 tail_positions[player, 0] = (
                     tail_positions[player, 0] + DIR_OFFSETS[tail_dir, 0]
@@ -244,8 +251,12 @@ class CUDASnakeGame:
                 body_direction_start_offset[player] = (
                     body_direction_start_offset[player] - 1
                 ) % body_direction[player].shape[0]
-                body_direction[player][body_direction_start_offset[player]] = (
+                body_direction[player][body_direction_start_offset[player] // 8] &= ~(
+                    0b11 << (2 * (body_direction_start_offset[player] % 8))
+                )
+                body_direction[player][body_direction_start_offset[player] // 8] |= (
                     INVERSE_MOVES[moves[player]]
+                    << (2 * (body_direction_start_offset[player] % 8))
                 )
                 x, y = head_positions[player]
                 bitmasks[y // 4, x // 4, player] |= 1 << (x % 4 + y % 4 * 4)
@@ -257,11 +268,11 @@ class CUDASnakeGame:
 
             x, y = head_positions[player]
             occupied_by_0 = (
-                bitmasks[y // 4, x // 4, 0] >> (x % 4 + y % 4 * 4) & 1
+                bitmasks[y // 4, x // 4, 0] >> (x % 4 + y % 4 * 4) & 0b1
                 and not is_dead[0]
             )
             occupied_by_1 = (
-                bitmasks[y // 4, x // 4, 1] >> (x % 4 + y % 4 * 4) & 1
+                bitmasks[y // 4, x // 4, 1] >> (x % 4 + y % 4 * 4) & 0b1
                 and not is_dead[1]
             )
             if occupied_by_0 or occupied_by_1:
@@ -286,11 +297,11 @@ class CUDASnakeGame:
                     x = food_idx % size
                     y = food_idx // size
                     occupied_by_0 = (
-                        bitmasks[y // 4, x // 4, 0] >> (x % 4 + y % 4 * 4) & 1
+                        bitmasks[y // 4, x // 4, 0] >> (x % 4 + y % 4 * 4) & 0b1
                         and not is_dead[0]
                     )
                     occupied_by_1 = (
-                        bitmasks[y // 4, x // 4, 1] >> (x % 4 + y % 4 * 4) & 1
+                        bitmasks[y // 4, x // 4, 1] >> (x % 4 + y % 4 * 4) & 0b1
                         and not is_dead[1]
                     )
                     if (not occupied_by_0) and (not occupied_by_1):
@@ -381,9 +392,12 @@ class CUDASnakeGame:
                 body_direction_start_offsets[player],
                 body_direction_start_offsets[player] + body_lengths[player],
             ):
-                offset = dir_offsets[
-                    body_direction[player, i % body_direction.shape[1]]
-                ]
+                direction = (
+                    body_direction[player, (i % body_direction.shape[1]) // 8]
+                    >> (2 * (i % body_direction.shape[1] % 8))
+                    & 0b11
+                )
+                offset = dir_offsets[direction]
                 hx += offset[0]
                 hy += offset[1]
 
@@ -443,9 +457,12 @@ if __name__ == "__main__":
 
     GAME_SIZE = 32
     RENDER_GAMES = int(64**2)
-    # NUM_GAMES = RENDER_GAMES
+    NUM_GAMES = RENDER_GAMES
+    # NUM_GAMES = 8388608
+    # NUM_GAMES = 4194304
+    # NUM_GAMES = 2097152
     # NUM_GAMES = 1048576
-    NUM_GAMES = 65536
+    # NUM_GAMES = 65536
     # NUM_GAMES = 25600
     # NUM_GAMES = 4096
     # NUM_GAMES = 1024
