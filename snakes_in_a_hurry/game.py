@@ -34,7 +34,7 @@ class ColorConfig:
     border: np.ndarray = field(default_factory=lambda: np.uint8([60, 60, 60]))
 
 
-class CUDASnake:
+class CUDASnakeGame:
     def __init__(self, size: int, num: int, color_config: Optional[ColorConfig] = None):
         assert (
             not size & 3 and 256 >= size > 4
@@ -56,7 +56,9 @@ class CUDASnake:
             ),
             body_direction_start_offset=np.empty((self.num, 2), dtype=np.uint16),
             body_lengths=np.empty((self.num, 2), dtype=np.uint16),
-            bitmasks=np.empty((self.num, self.size, self.size, 2), dtype=bool),
+            bitmasks=np.empty(
+                (self.num, self.size // 4, self.size // 4, 2), dtype=np.uint16
+            ),
             is_dead=np.empty((self.num, 2), dtype=bool),
             tail_positions=np.empty((self.num, 2, 2), dtype=np.uint8),
         )
@@ -90,19 +92,25 @@ class CUDASnake:
         )
         self.game_state_host.is_dead[...] = 0
 
-        self.game_state_host.bitmasks[...] = 0
-        self.game_state_host.bitmasks[
-            :, initial_head_positions[0, 1] - 1, initial_head_positions[0, 0], 0
+        bitmasks = np.zeros((2, self.size, self.size), dtype=np.uint16)
+        bitmasks[0, initial_head_positions[0, 1] - 1, initial_head_positions[0, 0]] = 1
+        bitmasks[
+            0, initial_head_positions[0, 1] - 1, initial_head_positions[0, 0] + 1
         ] = 1
-        self.game_state_host.bitmasks[
-            :, initial_head_positions[0, 1] - 1, initial_head_positions[0, 0] + 1, 0
+        bitmasks[1, initial_head_positions[1, 1] + 1, initial_head_positions[1, 0]] = 1
+        bitmasks[
+            1, initial_head_positions[1, 1] + 1, initial_head_positions[1, 0] - 1
         ] = 1
-        self.game_state_host.bitmasks[
-            :, initial_head_positions[1, 1] + 1, initial_head_positions[1, 0], 1
-        ] = 1
-        self.game_state_host.bitmasks[
-            :, initial_head_positions[1, 1] + 1, initial_head_positions[1, 0] - 1, 1
-        ] = 1
+        shifts = np.tile(
+            np.arange(16, dtype=np.uint16).reshape((4, 4)),
+            (self.size // 4, self.size // 4),
+        )
+        bitmasks = bitmasks << shifts
+        bitmasks = np.reshape(bitmasks, (2, self.size // 4, self.size // 4, 4, 4)).sum(
+            axis=(-1, -2)
+        )
+        bitmasks = np.transpose(bitmasks, (1, 2, 0))
+        self.game_state_host.bitmasks[:] = bitmasks
 
     def sync_to_device(self):
         ndarrays = list(self.game_state_host.__dict__.values())
@@ -217,9 +225,8 @@ class CUDASnake:
                 body_lengths[player] += 1
                 new_food_required = True
             elif not is_dead[player]:
-                bitmasks[
-                    tail_positions[player, 1], tail_positions[player, 0], player
-                ] = False
+                x, y = tail_positions[player]
+                bitmasks[y // 4, x // 4, player] &= ~(1 << (x % 4 + y % 4 * 4))
                 tail_dir = body_direction[
                     player,
                     (body_direction_start_offset[player] + body_lengths[player] - 1)
@@ -240,18 +247,24 @@ class CUDASnake:
                 body_direction[player][body_direction_start_offset[player]] = (
                     INVERSE_MOVES[moves[player]]
                 )
-                bitmasks[
-                    head_positions[player, 1], head_positions[player, 0], player
-                ] = True
+                x, y = head_positions[player]
+                bitmasks[y // 4, x // 4, player] |= 1 << (x % 4 + y % 4 * 4)
+
                 head_positions[player, 0] = new_head[0]
                 head_positions[player, 1] = new_head[1]
 
             cuda.syncthreads()
 
-            is_occupied = bitmasks[head_positions[player, 1], head_positions[player, 0]]
-            if (is_occupied[0] and not is_dead[0]) or (
-                is_occupied[1] and not is_dead[1]
-            ):
+            x, y = head_positions[player]
+            occupied_by_0 = (
+                bitmasks[y // 4, x // 4, 0] >> (x % 4 + y % 4 * 4) & 1
+                and not is_dead[0]
+            )
+            occupied_by_1 = (
+                bitmasks[y // 4, x // 4, 1] >> (x % 4 + y % 4 * 4) & 1
+                and not is_dead[1]
+            )
+            if occupied_by_0 or occupied_by_1:
                 is_dead[player] = True
 
             if new_food_required and player:
@@ -272,8 +285,14 @@ class CUDASnake:
                 while True:
                     x = food_idx % size
                     y = food_idx // size
-                    occupied_by_0 = bitmasks[y, x, 0] and not is_dead[0]
-                    occupied_by_1 = bitmasks[y, x, 1] and not is_dead[1]
+                    occupied_by_0 = (
+                        bitmasks[y // 4, x // 4, 0] >> (x % 4 + y % 4 * 4) & 1
+                        and not is_dead[0]
+                    )
+                    occupied_by_1 = (
+                        bitmasks[y // 4, x // 4, 1] >> (x % 4 + y % 4 * 4) & 1
+                        and not is_dead[1]
+                    )
                     if (not occupied_by_0) and (not occupied_by_1):
                         empty_seen += 1
                     if empty_seen == (food_empty_idx + 1):
@@ -377,7 +396,7 @@ class CUDASnake:
         self.kernel_render_games = kernel_render_games
 
     def increment_games_device(self, moves: DeviceNDArray):
-        grid_dim = (int(np.ceil(NUM_GAMES / self.warp_size)), 1)
+        grid_dim = (int(np.ceil(self.num / self.warp_size)), 1)
         block_dim = (self.warp_size, 2)
         self.kernel_increment_games[grid_dim, block_dim](
             self.game_state_device.head_positions,
@@ -398,7 +417,7 @@ class CUDASnake:
         if num != self.num_image_device:
             self.num_image_device = num
             grid_size = int(num**0.5) * (self.size + 1)
-            image = np.empty((grid_size, grid_size, 3), dtype=np.uint8)
+            image = np.zeros((grid_size, grid_size, 3), dtype=np.uint8)
             device_image = cuda.to_device(image)
             self.image_device = device_image
 
@@ -422,11 +441,11 @@ class CUDASnake:
 if __name__ == "__main__":
     import cv2 as cv
 
-    GAME_SIZE = 64
-    RENDER_GAMES = 4096
-    NUM_GAMES = RENDER_GAMES
+    GAME_SIZE = 32
+    RENDER_GAMES = int(64**2)
+    # NUM_GAMES = RENDER_GAMES
     # NUM_GAMES = 1048576
-    # NUM_GAMES = 65536
+    NUM_GAMES = 65536
     # NUM_GAMES = 25600
     # NUM_GAMES = 4096
     # NUM_GAMES = 1024
@@ -434,7 +453,7 @@ if __name__ == "__main__":
     # NUM_GAMES = 16
     # NUM_GAMES = 4
 
-    game = CUDASnake(GAME_SIZE, NUM_GAMES)
+    game = CUDASnakeGame(GAME_SIZE, NUM_GAMES)
     game.prepare_cuda()
 
     while True:
@@ -449,11 +468,12 @@ if __name__ == "__main__":
             moves = np.random.randint(0, 4, size=(game.num, 2)).astype(np.uint8)
             device_moves = cuda.to_device(moves)
             game.increment_games_device(device_moves)
-            image = game.get_image_from_device(RENDER_GAMES)
-            # image = np.kron(image, np.ones((1, 1, 1), dtype=np.uint8))
-            cv.imshow("image", image)
-            if cv.waitKey(1) & 0xFF == ord("q"):
-                quit()
+
+            if RENDER_GAMES:
+                image = game.get_image_from_device(RENDER_GAMES)
+                cv.imshow("image", image)
+                if cv.waitKey(1) & 0xFF == ord("q"):
+                    quit()
 
             game.game_state_host.is_dead = game.game_state_device.is_dead.copy_to_host()
             print(
