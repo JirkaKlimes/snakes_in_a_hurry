@@ -1,4 +1,3 @@
-import time
 import uuid
 from typing import Optional
 from dataclasses import dataclass, field
@@ -422,8 +421,8 @@ class CUDASnakeGame:
             self.game_state_device.bitmasks,
             self.game_state_device.is_dead,
             moves,
-            np.uint32(game.num),
-            np.uint32(game.size),
+            np.uint32(self.num),
+            np.uint32(self.size),
             self.rng_states_device,
         )
 
@@ -454,6 +453,7 @@ class CUDASnakeGame:
 
 if __name__ == "__main__":
     import cv2 as cv
+    import time
 
     GAME_SIZE = 32
     RENDER_GAMES = int(64**2)
