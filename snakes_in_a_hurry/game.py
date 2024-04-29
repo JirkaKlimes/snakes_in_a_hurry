@@ -114,9 +114,10 @@ class CUDASnakeGame:
             (self.size // 4, self.size // 4),
         )
         bitmasks = bitmasks << shifts
-        bitmasks = np.reshape(bitmasks, (2, self.size // 4, self.size // 4, 4, 4)).sum(
-            axis=(-1, -2)
-        )
+        bitmasks = np.reshape(
+            bitmasks,
+            (2, self.size // 4, 4, self.size // 4, 4),
+        ).sum(axis=(2, 4))
         bitmasks = np.transpose(bitmasks, (1, 2, 0))
         self.game_state_host.bitmasks[:] = bitmasks
 
@@ -124,6 +125,13 @@ class CUDASnakeGame:
         ndarrays = list(self.game_state_host.__dict__.values())
         device_ndarrays = map(cuda.to_device, ndarrays)
         self.game_state_device = GameState(*device_ndarrays)
+
+    def sync_to_host(self):
+        for device_arr, host_arr in zip(
+            self.game_state_device.__dict__.values(),
+            self.game_state_host.__dict__.values(),
+        ):
+            host_arr[:] = device_arr.copy_to_host()
 
     def prepare_cuda(self, rng_seed: int = None):
         ndarrays = list(self.game_state_host.__dict__.values())
@@ -426,7 +434,7 @@ class CUDASnakeGame:
             self.rng_states_device,
         )
 
-    def get_image_from_device(self, num: int):
+    def get_image_from_device(self, num: int, copy_to_host: bool = True):
         if num != self.num_image_device:
             self.num_image_device = num
             grid_size = int(num**0.5) * (self.size + 1)
@@ -447,15 +455,17 @@ class CUDASnakeGame:
             np.uint32(num),
             np.uint32(self.size),
         )
-        image = self.image_device.copy_to_host()
-        return image
+        if copy_to_host:
+            image = self.image_device.copy_to_host()
+            return image
+        return self.image_device
 
 
 if __name__ == "__main__":
     import cv2 as cv
     import time
 
-    GAME_SIZE = 32
+    GAME_SIZE = 8
     RENDER_GAMES = int(64**2)
     NUM_GAMES = RENDER_GAMES
     # NUM_GAMES = 8388608
