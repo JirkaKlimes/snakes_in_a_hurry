@@ -15,7 +15,7 @@ class GameState:
     body_directions: np.ndarray | DeviceNDArray
     body_direction_start_offset: np.ndarray | DeviceNDArray
     body_lengths: np.ndarray | DeviceNDArray
-    bitmasks: np.ndarray | DeviceNDArray
+    bitboards: np.ndarray | DeviceNDArray
     is_dead: np.ndarray | DeviceNDArray
     tail_positions: np.ndarray | DeviceNDArray
 
@@ -55,7 +55,7 @@ class CUDASnakeGame:
             ),
             body_direction_start_offset=np.empty((self.num, 2), dtype=np.uint16),
             body_lengths=np.empty((self.num, 2), dtype=np.uint16),
-            bitmasks=np.empty(
+            bitboards=np.empty(
                 (self.num, self.size // 4, self.size // 4, 2), dtype=np.uint16
             ),
             is_dead=np.empty((self.num, 2), dtype=np.uint8),
@@ -100,26 +100,26 @@ class CUDASnakeGame:
         )
         self.game_state_host.is_dead[...] = 0
 
-        bitmasks = np.zeros((2, self.size, self.size), dtype=np.uint16)
-        bitmasks[0, initial_head_positions[0, 1] - 1, initial_head_positions[0, 0]] = 1
-        bitmasks[
+        bitboards = np.zeros((2, self.size, self.size), dtype=np.uint16)
+        bitboards[0, initial_head_positions[0, 1] - 1, initial_head_positions[0, 0]] = 1
+        bitboards[
             0, initial_head_positions[0, 1] - 1, initial_head_positions[0, 0] + 1
         ] = 1
-        bitmasks[1, initial_head_positions[1, 1] + 1, initial_head_positions[1, 0]] = 1
-        bitmasks[
+        bitboards[1, initial_head_positions[1, 1] + 1, initial_head_positions[1, 0]] = 1
+        bitboards[
             1, initial_head_positions[1, 1] + 1, initial_head_positions[1, 0] - 1
         ] = 1
         shifts = np.tile(
             np.arange(16, dtype=np.uint16).reshape((4, 4)),
             (self.size // 4, self.size // 4),
         )
-        bitmasks = bitmasks << shifts
-        bitmasks = np.reshape(
-            bitmasks,
+        bitboards = bitboards << shifts
+        bitboards = np.reshape(
+            bitboards,
             (2, self.size // 4, 4, self.size // 4, 4),
         ).sum(axis=(2, 4))
-        bitmasks = np.transpose(bitmasks, (1, 2, 0))
-        self.game_state_host.bitmasks[:] = bitmasks
+        bitboards = np.transpose(bitboards, (1, 2, 0))
+        self.game_state_host.bitboards[:] = bitboards
 
     def sync_to_device(self):
         ndarrays = list(self.game_state_host.__dict__.values())
@@ -162,7 +162,7 @@ class CUDASnakeGame:
             many_body_dir_start,
             many_body_dir,
             many_food_pos,
-            many_bitmasks,
+            many_bitboards,
             many_dead,
             many_moves,
             num_games,
@@ -186,7 +186,7 @@ class CUDASnakeGame:
             body_direction_start_offset = many_body_dir_start[game_idx]
             body_direction = many_body_dir[game_idx]
             food_position = many_food_pos[game_idx]
-            bitmasks = many_bitmasks[game_idx]
+            bitboards = many_bitboards[game_idx]
             is_dead = many_dead[game_idx]
             moves = many_moves[game_idx]
 
@@ -241,7 +241,7 @@ class CUDASnakeGame:
                 new_food_required = True
             elif not is_dead[player]:
                 x, y = tail_positions[player]
-                bitmasks[y // 4, x // 4, player] &= ~(1 << (x % 4 + y % 4 * 4))
+                bitboards[y // 4, x // 4, player] &= ~(1 << (x % 4 + y % 4 * 4))
                 s = (
                     body_direction_start_offset[player] + body_lengths[player] - 1
                 ) % body_direction[player].shape[0]
@@ -266,7 +266,7 @@ class CUDASnakeGame:
                     << (2 * (body_direction_start_offset[player] % 8))
                 )
                 x, y = head_positions[player]
-                bitmasks[y // 4, x // 4, player] |= 1 << (x % 4 + y % 4 * 4)
+                bitboards[y // 4, x // 4, player] |= 1 << (x % 4 + y % 4 * 4)
 
                 head_positions[player, 0] = new_head[0]
                 head_positions[player, 1] = new_head[1]
@@ -275,11 +275,11 @@ class CUDASnakeGame:
 
             x, y = head_positions[player]
             occupied_by_0 = (
-                bitmasks[y // 4, x // 4, 0] >> (x % 4 + y % 4 * 4) & 0b1
+                bitboards[y // 4, x // 4, 0] >> (x % 4 + y % 4 * 4) & 0b1
                 and not is_dead[0]
             )
             occupied_by_1 = (
-                bitmasks[y // 4, x // 4, 1] >> (x % 4 + y % 4 * 4) & 0b1
+                bitboards[y // 4, x // 4, 1] >> (x % 4 + y % 4 * 4) & 0b1
                 and not is_dead[1]
             )
             if occupied_by_0 or occupied_by_1:
@@ -304,11 +304,11 @@ class CUDASnakeGame:
                     x = food_idx % size
                     y = food_idx // size
                     occupied_by_0 = (
-                        bitmasks[y // 4, x // 4, 0] >> (x % 4 + y % 4 * 4) & 0b1
+                        bitboards[y // 4, x // 4, 0] >> (x % 4 + y % 4 * 4) & 0b1
                         and not is_dead[0]
                     )
                     occupied_by_1 = (
-                        bitmasks[y // 4, x // 4, 1] >> (x % 4 + y % 4 * 4) & 0b1
+                        bitboards[y // 4, x // 4, 1] >> (x % 4 + y % 4 * 4) & 0b1
                         and not is_dead[1]
                     )
                     if (not occupied_by_0) and (not occupied_by_1):
@@ -426,7 +426,7 @@ class CUDASnakeGame:
             self.game_state_device.body_direction_start_offset,
             self.game_state_device.body_directions,
             self.game_state_device.food_position,
-            self.game_state_device.bitmasks,
+            self.game_state_device.bitboards,
             self.game_state_device.is_dead,
             moves,
             np.uint32(self.num),
